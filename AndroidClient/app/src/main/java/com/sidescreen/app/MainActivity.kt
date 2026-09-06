@@ -10,6 +10,7 @@ import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.SurfaceTexture
 import android.graphics.drawable.ColorDrawable
+import android.hardware.DataSpace
 import android.hardware.usb.UsbManager
 import android.media.MediaFormat
 import android.os.Build
@@ -21,6 +22,7 @@ import android.provider.Settings
 import android.view.MotionEvent
 import android.view.Surface
 import android.view.SurfaceHolder
+import android.view.SurfaceControl
 import android.view.TextureView
 import android.view.View
 import android.view.Window
@@ -309,6 +311,26 @@ class MainActivity : AppCompatActivity() {
                     mainDiag("surfaceChanged: ${width}x$height")
                     log("Surface changed: ${width}x$height")
                     currentSurfaceHolder = holder
+
+                    // Explicitly identify the video surface as BT.709.
+                    // applyTransactionToFrame() applies the dataspace to the
+                    // frame being presented by SurfaceView.
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                        try {
+                            val transaction = SurfaceControl.Transaction()
+                                .setDataSpace(
+                                    binding.surfaceView.surfaceControl,
+                                    DataSpace.DATASPACE_BT709,
+                                )
+
+                            binding.surfaceView.applyTransactionToFrame(transaction)
+
+                            mainDiag("SurfaceView dataspace set to BT709")
+                        } catch (e: Exception) {
+                            mainDiag("Failed to set SurfaceView dataspace: ${e.message}")
+                        }
+                    }
+
                     initializeDecoderForCurrentSurface()
                 }
 
