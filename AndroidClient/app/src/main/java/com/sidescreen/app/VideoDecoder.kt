@@ -3,18 +3,19 @@ package com.sidescreen.app
 import android.media.MediaCodec
 import android.media.MediaCodecList
 import android.media.MediaFormat
+import android.media.Image
+import java.nio.ByteBuffer
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Process
 import android.util.Log
 import android.view.Display
-import android.view.Surface
 import java.util.concurrent.ConcurrentLinkedQueue
 
 private fun diagLog(msg: String) = DiagLog.log("VD", msg)
 
 class VideoDecoder(
-    private val surface: Surface,
+    private val framePool: VideoFramePool,
     private val display: Display? = null,
     initialWidth: Int = 1920,
     initialHeight: Int = 1200,
@@ -56,6 +57,16 @@ class VideoDecoder(
 
     var onFrameRendered: ((Long) -> Unit)? = null
     var onFrameStats: ((fps: Double, variance: Double) -> Unit)? = null
+    var onFrame: ((VideoFrame) -> Unit)? = null
+
+    private var pixelFormat = VideoPixelFormat.YUV420P
+    private var chromaInterleaved = false
+    private var outStride = 0
+    private var outSliceHeight = 0
+    private var outWidth = initialWidth
+    private var outHeight = initialHeight
+    private var discardOutputsUntilKeyframe = false
+    private var planeScratch = ByteArray(0)
     var onFrameDecoded: ((ByteArray) -> Unit)? = null
     var onKeyframeRequired: ((force: Boolean, reason: String) -> Unit)? = null
 
@@ -153,7 +164,7 @@ class VideoDecoder(
             format.setInteger(MediaFormat.KEY_PRIORITY, 0)
             format.setInteger(MediaFormat.KEY_OPERATING_RATE, displayRefreshRate.toInt())
             format.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
-            codec.configure(format, surface, null, 0)
+            codec.configure(format, null, null, 0)
             configured = true
             diagLog("Configured with full low-latency")
         } catch (e: Exception) {
@@ -173,7 +184,7 @@ class VideoDecoder(
                     )
                 basicFormat.setInteger(MediaFormat.KEY_PRIORITY, 0)
                 basicFormat.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
-                codec.configure(basicFormat, surface, null, 0)
+                codec.configure(basicFormat, null, null, 0)
                 configured = true
                 diagLog("Configured with basic format")
             } catch (e: Exception) {
@@ -192,7 +203,7 @@ class VideoDecoder(
                         currentWidth,
                         currentHeight,
                     )
-                codec.configure(minimalFormat, surface, null, 0)
+                codec.configure(minimalFormat, null, null, 0)
                 diagLog("Configured with minimal format")
             } catch (e: Exception) {
                 diagLog("All configure attempts failed: ${e.message}")
@@ -212,7 +223,7 @@ class VideoDecoder(
         decoder = codec
         diagLog(
             "Decoder started: ${currentWidth}x$currentHeight @ ${displayRefreshRate}Hz, " +
-                "surface=$surface, valid=${surface.isValid}",
+                "output=byte-buffer",
         )
     }
 
@@ -314,7 +325,7 @@ class VideoDecoder(
                     .joinToString(" ") { String.format("%02x", it) }
             diagLog(
                 "First frame: size=$frameSize, header=[$header], " +
-                    "keyframe=$isKeyframe, surface=$surface, valid=${surface.isValid}",
+                    "keyframe=$isKeyframe, output=byte-buffer",
             )
         }
         if (inputFrameCount % 60L == 0L) {
@@ -437,16 +448,15 @@ class VideoDecoder(
     ) {
         try {
             outputFrameCount++
+
             if (outputFrameCount == 1L) {
                 diagLog("First output frame! size=${info.size}, flags=${info.flags}")
             }
 
-            // Decoder latency: time from queueInputBuffer (where we encoded
-            // System.nanoTime()/1000 as PTS) to now. Captures how long the
-            // frame spent inside the codec's input/reorder/output queues.
             val nowNs = System.nanoTime()
             val latencyNs = nowNs - info.presentationTimeUs * 1000L
             val hasValidLatency = latencyNs in 0..MAX_REASONABLE_LATENCY_NS
+
             if (hasValidLatency) {
                 latencySumNs += latencyNs
                 latencySamples++
@@ -454,14 +464,23 @@ class VideoDecoder(
             }
 
             if (outputFrameCount % 60L == 0L) {
-                val avgMs = if (latencySamples > 0) latencySumNs / latencySamples / 1_000_000.0 else 0.0
+                val avgMs =
+                    if (latencySamples > 0) {
+                        latencySumNs / latencySamples / 1_000_000.0
+                    } else {
+                        0.0
+                    }
                 val maxMs = latencyMaxNs / 1_000_000.0
-                val inBufs = availableInputBuffers.size
+
                 diagLog(
-                    "Output #$outputFrameCount: decoder latency avg=${"%.1f".format(avgMs)}ms " +
-                        "max=${"%.1f".format(maxMs)}ms over $latencySamples samples, " +
-                        "input bufs avail=$inBufs, dropped=$droppedFrames",
+                    "Output #$outputFrameCount: decoder latency " +
+                        "avg=${"%.1f".format(avgMs)}ms " +
+                        "max=${"%.1f".format(maxMs)}ms " +
+                        "over $latencySamples samples, " +
+                        "input bufs avail=${availableInputBuffers.size}, " +
+                        "dropped=$droppedFrames",
                 )
+
                 latencySumNs = 0
                 latencySamples = 0
                 latencyMaxNs = 0
@@ -475,26 +494,454 @@ class VideoDecoder(
             if (!shouldRender) {
                 droppedFrames++
                 staleOutputDrops++
+
                 if (staleOutputDrops <= 3L || staleOutputDrops % 60L == 0L) {
                     diagLog(
-                        "Dropping stale output frame: latency=${"%.1f".format(latencyNs / 1_000_000.0)}ms, " +
+                        "Dropping stale output frame: " +
+                            "latency=${"%.1f".format(latencyNs / 1_000_000.0)}ms, " +
                             "staleDrops=$staleOutputDrops",
                     )
                 }
+
                 codec.releaseOutputBuffer(index, false)
                 updateStats()
                 return
             }
 
-            codec.releaseOutputBuffer(index, true)
-            trackFrameTiming(System.nanoTime())
-            updateStats()
+            if (discardOutputsUntilKeyframe) {
+                if ((info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) == 0) {
+                    codec.releaseOutputBuffer(index, false)
+                    droppedFrames++
+                    updateStats()
+                    return
+                }
+
+                discardOutputsUntilKeyframe = false
+                diagLog("Resumed output at keyframe")
+            }
+
+            detectOutputFormat(codec)
+
+            val width = outWidth.coerceAtLeast(1)
+            val height = outHeight.coerceAtLeast(1)
+
+            val frame = framePool.acquire(pixelFormat, width, height)
+
+            try {
+                if (!fillFrame(codec, index, pixelFormat, width, height, frame)) {
+                    framePool.release(frame)
+                    codec.releaseOutputBuffer(index, false)
+                    droppedFrames++
+                    return
+                }
+
+                onFrame?.invoke(frame)
+                trackFrameTiming(nowNs)
+                updateStats()
+
+                // Ownership transfers to the renderer callback.
+                // It must return the frame to framePool when no longer needed.
+            } catch (e: Exception) {
+                framePool.release(frame)
+                throw e
+            } finally {
+                codec.releaseOutputBuffer(index, false)
+            }
         } catch (e: Exception) {
-            Log.e(TAG, "releaseOutputBuffer failed", e)
+            Log.e(TAG, "Output buffer handling failed", e)
             try {
                 codec.releaseOutputBuffer(index, false)
             } catch (_: Exception) {
             }
+        }
+    }
+
+    private fun detectOutputFormat(codec: MediaCodec) {
+        val format = try {
+            codec.outputFormat
+        } catch (_: Exception) {
+            return
+        }
+
+        val colorFormat =
+            if (format.containsKey(MediaFormat.KEY_COLOR_FORMAT)) {
+                format.getInteger(MediaFormat.KEY_COLOR_FORMAT)
+            } else {
+                0
+            }
+
+        outWidth =
+            if (format.containsKey(MediaFormat.KEY_WIDTH)) {
+                format.getInteger(MediaFormat.KEY_WIDTH)
+            } else {
+                currentWidth
+            }
+
+        outHeight =
+            if (format.containsKey(MediaFormat.KEY_HEIGHT)) {
+                format.getInteger(MediaFormat.KEY_HEIGHT)
+            } else {
+                currentHeight
+            }
+
+        outStride =
+            if (format.containsKey("stride")) {
+                format.getInteger("stride")
+            } else {
+                outWidth
+            }
+
+        outSliceHeight =
+            if (format.containsKey("slice-height")) {
+                format.getInteger("slice-height")
+            } else {
+                outHeight
+            }
+
+        pixelFormat =
+            when (colorFormat) {
+                1, 0x7F000789 -> VideoPixelFormat.RGBA
+                19, 20, 0x7F420888 -> VideoPixelFormat.YUV420P
+                21, 22 -> VideoPixelFormat.NV12
+                else -> VideoPixelFormat.YUV420P
+            }
+
+        diagLog(
+            "Output format: color-format=0x${colorFormat.toString(16)}, " +
+                "pixelFormat=$pixelFormat, " +
+                "size=${outWidth}x$outHeight, " +
+                "stride=$outStride, slice=$outSliceHeight",
+        )
+    }
+
+    private fun fillFrame(
+        codec: MediaCodec,
+        index: Int,
+        format: VideoPixelFormat,
+        width: Int,
+        height: Int,
+        frame: VideoFrame,
+    ): Boolean {
+        return when (format) {
+            VideoPixelFormat.YUV420P -> fillYuv420(codec, index, width, height, frame)
+            VideoPixelFormat.NV12 -> fillNv12(codec, index, width, height, frame)
+            VideoPixelFormat.RGBA -> fillRgba(codec, index, width, height, frame)
+        }
+    }
+
+    private fun fillYuv420(
+        codec: MediaCodec,
+        index: Int,
+        width: Int,
+        height: Int,
+        frame: VideoFrame,
+    ): Boolean {
+        val image =
+            try {
+                codec.getOutputImage(index)
+            } catch (e: Exception) {
+                diagLog("getOutputImage failed: ${e.message}")
+                null
+            }
+
+        if (image != null) {
+            try {
+                val planes = image.planes
+                if (planes.size < 3) return false
+
+                val yPlane = planes[0]
+                val uPlane = planes[1]
+                val vPlane = planes[2]
+
+                val y = frame.y ?: return false
+
+                copyPlane(
+                    yPlane.buffer,
+                    yPlane.rowStride,
+                    yPlane.pixelStride,
+                    width,
+                    height,
+                    y,
+                )
+
+                if (uPlane.pixelStride == 1 && vPlane.pixelStride == 1) {
+                    val u = frame.u ?: return false
+                    val v = frame.v ?: return false
+
+                    copyPlane(
+                        uPlane.buffer,
+                        uPlane.rowStride,
+                        uPlane.pixelStride,
+                        (width + 1) / 2,
+                        (height + 1) / 2,
+                        u,
+                    )
+
+                    copyPlane(
+                        vPlane.buffer,
+                        vPlane.rowStride,
+                        vPlane.pixelStride,
+                        (width + 1) / 2,
+                        (height + 1) / 2,
+                        v,
+                    )
+                } else {
+                    chromaInterleaved = true
+                    pixelFormat = VideoPixelFormat.NV12
+
+                    // The acquired frame has to match the actual output format.
+                    // This path is only used when Qualcomm exposes interleaved
+                    // chroma through flexible Image planes.
+                    val uv = frame.uv
+                    if (uv == null) {
+                        image.close()
+                        return false
+                    }
+
+                    copyInterleavedChroma(
+                        uPlane.buffer,
+                        vPlane.buffer,
+                        uPlane.rowStride,
+                        vPlane.rowStride,
+                        uPlane.pixelStride,
+                        vPlane.pixelStride,
+                        (width + 1) / 2,
+                        (height + 1) / 2,
+                        uv,
+                    )
+                }
+
+                return true
+            } finally {
+                image.close()
+            }
+        }
+
+        val buffer = codec.getOutputBuffer(index) ?: return false
+        val y = frame.y ?: return false
+        val u = frame.u ?: return false
+        val v = frame.v ?: return false
+
+        val chromaWidth = (width + 1) / 2
+        val chromaHeight = (height + 1) / 2
+        val ySize = width * height
+        val uvSize = chromaWidth * chromaHeight
+
+        if (buffer.remaining() < ySize + uvSize * 2) return false
+
+        buffer.get(y, 0, ySize)
+        buffer.get(u, 0, uvSize)
+        buffer.get(v, 0, uvSize)
+
+        return true
+    }
+
+    private fun fillNv12(
+        codec: MediaCodec,
+        index: Int,
+        width: Int,
+        height: Int,
+        frame: VideoFrame,
+    ): Boolean {
+        val image =
+            try {
+                codec.getOutputImage(index)
+            } catch (_: Exception) {
+                null
+            }
+
+        if (image != null) {
+            try {
+                val planes = image.planes
+                if (planes.size < 2) return false
+
+                val yPlane = planes[0]
+                val uvPlane = planes[1]
+
+                val y = frame.y ?: return false
+                val uv = frame.uv ?: return false
+
+                copyPlane(
+                    yPlane.buffer,
+                    yPlane.rowStride,
+                    yPlane.pixelStride,
+                    width,
+                    height,
+                    y,
+                )
+
+                copyPlaneInterleaved(
+                    uvPlane.buffer,
+                    uvPlane.rowStride,
+                    uvPlane.pixelStride,
+                    (width + 1) / 2,
+                    (height + 1) / 2,
+                    uv,
+                )
+
+                return true
+            } finally {
+                image.close()
+            }
+        }
+
+        val buffer = codec.getOutputBuffer(index) ?: return false
+        val y = frame.y ?: return false
+        val uv = frame.uv ?: return false
+
+        val ySize = width * height
+        val uvSize = ((width + 1) / 2) * ((height + 1) / 2) * 2
+
+        if (buffer.remaining() < ySize + uvSize) return false
+
+        buffer.get(y, 0, ySize)
+        buffer.get(uv, 0, uvSize)
+
+        return true
+    }
+
+    private fun fillRgba(
+        codec: MediaCodec,
+        index: Int,
+        width: Int,
+        height: Int,
+        frame: VideoFrame,
+    ): Boolean {
+        val rgba = frame.rgba ?: return false
+        val buffer = codec.getOutputBuffer(index) ?: return false
+        val required = width * height * 4
+
+        if (buffer.remaining() < required) return false
+
+        buffer.get(rgba, 0, required)
+        return true
+    }
+
+    private fun copyPlane(
+        src: ByteBuffer,
+        rowStride: Int,
+        pixelStride: Int,
+        width: Int,
+        height: Int,
+        dst: ByteArray,
+    ) {
+        val base = src.position()
+        val rowBytes = width
+
+        ensureScratch(rowBytes)
+
+        for (row in 0 until height) {
+            val rowStart = base + row * rowStride
+
+            if (pixelStride == 1) {
+                src.position(rowStart)
+                val count = minOf(width, src.limit() - rowStart)
+                if (count > 0) src.get(dst, row * width, count)
+
+                if (count < width) {
+                    java.util.Arrays.fill(
+                        dst,
+                        row * width + maxOf(count, 0),
+                        row * width + width,
+                        0x80.toByte(),
+                    )
+                }
+            } else {
+                val needed = width * pixelStride
+                ensureScratch(needed)
+
+                src.position(rowStart)
+                val count = minOf(needed, src.limit() - rowStart)
+
+                if (count > 0) src.get(planeScratch, 0, count)
+
+                val dstOffset = row * width
+                var x = 0
+                var out = 0
+
+                while (x < count && out < width) {
+                    dst[dstOffset + out] = planeScratch[x]
+                    x += pixelStride
+                    out++
+                }
+
+                while (out < width) {
+                    dst[dstOffset + out] = 0x80.toByte()
+                    out++
+                }
+            }
+        }
+
+        src.position(base)
+    }
+
+    private fun copyPlaneInterleaved(
+        src: ByteBuffer,
+        rowStride: Int,
+        pixelStride: Int,
+        width: Int,
+        height: Int,
+        dst: ByteArray,
+    ) {
+        val base = src.position()
+        val rowBytes = width * 2
+
+        for (row in 0 until height) {
+            val rowStart = base + row * rowStride
+            src.position(rowStart)
+
+            if (pixelStride == 2) {
+                val count = minOf(rowBytes, src.limit() - rowStart)
+                if (count > 0) src.get(dst, row * rowBytes, count)
+            } else {
+                val dstOffset = row * rowBytes
+                val count = minOf(width, src.limit() - rowStart)
+
+                var i = 0
+                while (i < count) {
+                    val value = src.get(rowStart + i)
+                    dst[dstOffset + i * 2] = value
+                    i++
+                }
+            }
+        }
+
+        src.position(base)
+    }
+
+    private fun copyInterleavedChroma(
+        u: ByteBuffer,
+        v: ByteBuffer,
+        uRowStride: Int,
+        vRowStride: Int,
+        uPixelStride: Int,
+        vPixelStride: Int,
+        width: Int,
+        height: Int,
+        dst: ByteArray,
+    ) {
+        val uBase = u.position()
+        val vBase = v.position()
+
+        for (row in 0 until height) {
+            val dstOffset = row * width * 2
+
+            for (x in 0 until width) {
+                val uPos = uBase + row * uRowStride + x * uPixelStride
+                val vPos = vBase + row * vRowStride + x * vPixelStride
+
+                if (uPos < u.limit()) dst[dstOffset + x * 2] = u.get(uPos)
+                if (vPos < v.limit()) dst[dstOffset + x * 2 + 1] = v.get(vPos)
+            }
+        }
+
+        u.position(uBase)
+        v.position(vBase)
+    }
+
+    private fun ensureScratch(size: Int) {
+        if (planeScratch.size < size) {
+            planeScratch = ByteArray(size)
         }
     }
 
