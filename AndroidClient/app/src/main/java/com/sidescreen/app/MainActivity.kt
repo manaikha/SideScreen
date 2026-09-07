@@ -942,7 +942,6 @@ class MainActivity : AppCompatActivity() {
                             CodecCapabilities.REFERENCE_FPS,
                         )
                     }
-                val cap = CodecCapabilities.maxDecodeSize(mime)
 
                 runOnUiThread {
                     val capText =
