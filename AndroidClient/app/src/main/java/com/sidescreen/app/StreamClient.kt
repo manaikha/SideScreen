@@ -21,7 +21,7 @@ import java.util.concurrent.TimeUnit
 class StreamClient(
     private val host: String,
     private val port: Int,
-    private val context: Context? = null,
+    private val context: Context,
 ) {
     private var socket: Socket? = null
     private var inputStream: DataInputStream? = null
@@ -33,6 +33,9 @@ class StreamClient(
     var onFrameReceived: ((ByteArray, Int, Long, Boolean) -> Unit)? = null
     var onConnectionStatus: ((Boolean) -> Unit)? = null
     var onDisplaySize: ((Int, Int, Int, Boolean, Boolean) -> Unit)? = null
+
+    /** Logical desktop size behind the stream. Display only; never size the decoder from it. */
+    var onDesktopSize: ((Int, Int) -> Unit)? = null
     var onStats: ((Double, Double) -> Unit)? = null
 
     /** Invoked when the server confirms the stream codec (true = HEVC). */
@@ -128,6 +131,7 @@ class StreamClient(
                 codecNegotiated = false
                 advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
                 advertiseDecoderLimits() // Also before type 8, for the same reason
+                advertiseDesktopGeometrySupport() // Likewise
                 advertiseFrameMetadataSupport()
                 isConnected = true
                 lastKeyframeReceivedNs = 0L
@@ -180,14 +184,12 @@ class StreamClient(
         try {
             val sock = Socket()
             sock.tcpNoDelay = true
+            val cm = context.getSystemService(ConnectivityManager::class.java)
             val wifiNetwork =
-                context?.let { ctx ->
-                    val cm = ctx.getSystemService(ConnectivityManager::class.java)
-                    cm.allNetworks.firstOrNull { net ->
-                        val caps = cm.getNetworkCapabilities(net)
-                        caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true &&
-                            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                    }
+                cm.allNetworks.firstOrNull { net ->
+                    val caps = cm.getNetworkCapabilities(net)
+                    caps?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true &&
+                        caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
                 }
             if (wifiNetwork != null) {
                 Log.i(TAG, "openWirelessSocket: binding socket to WiFi network $wifiNetwork")
@@ -353,6 +355,7 @@ class StreamClient(
                 codecNegotiated = false
                 advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
                 advertiseDecoderLimits() // Also before type 8, for the same reason
+                advertiseDesktopGeometrySupport() // Likewise
                 advertiseFrameMetadataSupport()
                 isConnected = true
                 diagLog("Wireless connected to $host:$port")
@@ -376,6 +379,14 @@ class StreamClient(
         }
     }
 
+    private fun advertiseDesktopGeometrySupport() {
+        outputStream?.let { out ->
+            out.writeByte(MESSAGE_CLIENT_SUPPORTS_DESKTOP_GEOMETRY)
+            out.flush()
+            diagLog("Advertised desktop-geometry support")
+        }
+    }
+
     private fun advertiseFrameMetadataSupport() {
         outputStream?.let { out ->
             out.writeByte(MESSAGE_CLIENT_SUPPORTS_FRAME_METADATA)
@@ -394,7 +405,15 @@ class StreamClient(
     }
 
     private fun advertiseDecoderLimits() {
-        val (maxW, maxH) = CodecCapabilities.maxDecodeSize(CodecCapabilities.streamMime) ?: return
+        val mime = CodecCapabilities.streamMime
+        val panel = PanelGeometry.ofDefaultDisplay(context)
+        // Nominal limit only as a fallback: it ignores blocks-per-second, so on most devices it is
+        // far too high to protect anything.
+        val limit =
+            panel?.let { CodecCapabilities.maxStreamSize(mime, it.width, it.height, CodecCapabilities.REFERENCE_FPS) }
+                ?: CodecCapabilities.nominalMaxDecodeSize(mime)
+                ?: return
+        val (maxW, maxH) = limit
         val w = maxW.coerceAtMost(16383)
         val h = maxH.coerceAtMost(16383)
         if (w < 256 || h < 256) return
@@ -408,7 +427,7 @@ class StreamClient(
             out.writeByte(0x80 or ((h shr 7) and 0x7F))
             out.writeByte(0x80 or (h and 0x7F))
             out.flush()
-            diagLog("Advertised decoder limit ${w}x$h for ${CodecCapabilities.streamMime}")
+            diagLog("Advertised stream limit ${w}x$h for $mime (panel=$panel)")
         }
     }
 
@@ -447,6 +466,13 @@ class StreamClient(
                             val sentTime = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN).long
                             val rtt = (System.nanoTime() - sentTime) / 1_000_000.0 // ms
                             onLatencyMeasured?.invoke(rtt)
+                        }
+
+                        MESSAGE_DESKTOP_GEOMETRY -> {
+                            val dw = input.readInt()
+                            val dh = input.readInt()
+                            diagLog("Desktop geometry: ${dw}x$dh")
+                            onDesktopSize?.invoke(dw, dh)
                         }
 
                         MESSAGE_CODEC_SELECTED -> {
@@ -693,7 +719,10 @@ class StreamClient(
 
     companion object {
         private const val TAG = "StreamClient"
-        private const val MAX_FRAME_SIZE = 5 * 1024 * 1024 // 5MB
+
+        // Only a desync guard — acquireBuffer allocates the real frame size, so a generous bound
+        // costs nothing. Must clear a keyframe at panel resolution and the highest offered bitrate.
+        private const val MAX_FRAME_SIZE = 32 * 1024 * 1024 // 32MB
         private const val PAIRING_READ_TIMEOUT_MS = 10_000
         private const val KEYFRAME_REQUEST_INTERVAL_NS = 500_000_000L
         private const val KEYFRAME_STALE_INTERVAL_NS = 1_500_000_000L
@@ -704,6 +733,8 @@ class StreamClient(
         private const val MESSAGE_CLIENT_AVC_ONLY = 9
         private const val MESSAGE_CODEC_SELECTED = 10
         private const val MESSAGE_CLIENT_DECODER_LIMITS = 11
+        private const val MESSAGE_CLIENT_SUPPORTS_DESKTOP_GEOMETRY = 12
+        private const val MESSAGE_DESKTOP_GEOMETRY = 13
         private const val FRAME_FLAG_KEYFRAME = 1
         private const val KEYFRAME_REQUEST_FLAG_FORCE = 1
 
